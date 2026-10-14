@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>Label</key><string>com.xyhelper.remoteipad</string>
+<key>ProgramArguments</key><array><string>/var/jb/usr/bin/remoteipadd</string></array>
+<key>UserName</key><string>root</string>
+<key>RunAtLoad</key><true/>
+<key>KeepAlive</key><true/>
+<key>ThrottleInterval</key><integer>10</integer>
+<key>ProcessType</key><string>Interactive</string>
+<key>JetsamProperties</key><dict><key>MemoryLimit</key><integer>256</integer></dict>
+<key>StandardOutPath</key><string>/var/jb/var/lib/remoteipad/service.log</string>
+<key>StandardErrorPath</key><string>/var/jb/var/lib/remoteipad/service.log</string>
+</dict></plist>

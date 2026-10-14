@@ -1,0 +1,9 @@
+Package: com.xyhelper.remoteipad
+Name: XYHelper Remote RDP
+Version: 0.4.0~rc7
+Architecture: iphoneos-arm64
+Description: LAN RDP remote control with NLA, hardware AVC420 and Settings controls.
+Maintainer: xyhelper
+Author: xyhelper
+Section: Networking
+Depends: firmware (>= 15.0), mobilesubstrate

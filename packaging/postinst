@@ -1,0 +1,37 @@
+#!/var/jb/bin/sh
+set -eu
+umask 077
+CONFIG=/var/jb/var/lib/remoteipad
+test ! -L "$CONFIG"
+test ! -L "$CONFIG/config.json"
+test ! -L "$CONFIG/service.log"
+test ! -L "$CONFIG/service.log.previous"
+mkdir -p "$CONFIG"
+chmod 755 "$CONFIG"
+chown root:wheel "$CONFIG"
+if [ ! -f "$CONFIG/config.json" ]; then
+    if [ -f /var/mobile/Library/RemoteIPad/config.json ]; then
+        cp /var/mobile/Library/RemoteIPad/config.json "$CONFIG/config.json"
+    fi
+fi
+if [ -f "$CONFIG/config.json" ]; then
+    chmod 600 "$CONFIG/config.json"
+    chown root:wheel "$CONFIG/config.json"
+fi
+/var/jb/usr/bin/remoteipadd --prepare-install
+if [ -f "$CONFIG/service.log" ]; then
+    mv -f "$CONFIG/service.log" "$CONFIG/service.log.previous"
+fi
+touch "$CONFIG/service.log"
+chmod 600 "$CONFIG/service.log"
+if launchctl print system/com.xyhelper.remoteipad >/dev/null 2>&1; then
+    launchctl bootout system/com.xyhelper.remoteipad
+fi
+launchctl bootstrap system /var/jb/Library/LaunchDaemons/com.xyhelper.remoteipad.plist
+ps -A -o pid=,comm= > "$CONFIG/settings-processes"
+while read -r pid executable; do
+    if [ "$executable" = "/Applications/Preferences.app/Preferences" ]; then
+        kill -KILL "$pid"
+    fi
+done < "$CONFIG/settings-processes"
+rm "$CONFIG/settings-processes"

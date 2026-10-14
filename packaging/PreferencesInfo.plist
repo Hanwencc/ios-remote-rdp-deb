@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>com.xyhelper.remoteipad.preferences</string>
+<key>CFBundleName</key><string>RemoteIPad</string>
+<key>CFBundleDisplayName</key><string>XYHelper Remote RDP</string>
+<key>CFBundleExecutable</key><string>RemoteIPad</string>
+<key>CFBundlePackageType</key><string>BNDL</string>
+<key>NSPrincipalClass</key><string>RIPreferencesController</string>
+</dict></plist>
