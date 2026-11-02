@@ -2,12 +2,14 @@
 #include "AVCSample.hpp"
 #include "OutputFlow.hpp"
 #include "LatencyFlow.hpp"
+#include "InputFlow.hpp"
 #include <freerdp/freerdp.h>
 #include <freerdp/peer.h>
 #include <freerdp/settings.h>
 #include <freerdp/crypto/certificate.h>
 #include <freerdp/crypto/privatekey.h>
 #include <freerdp/server/rdpgfx.h>
+#include <freerdp/server/cliprdr.h>
 #include <freerdp/channels/wtsvc.h>
 #include <freerdp/channels/channels.h>
 #include <freerdp/channels/drdynvc.h>
@@ -44,11 +46,22 @@ struct Frame {
     bool key;
 };
 class Transport;
+struct InputSession {
+    inputFlow::Keys keys;
+    inputFlow::Unicode unicode;
+    inputFlow::Clipboard clipboard;
+    std::u16string text;
+    size_t offset = 0;
+    bool homeKey = false;
+};
 struct PeerContext {
     rdpContext base;
     Transport *server;
     HANDLE channels;
     RdpgfxServerContext *gfx;
+    CliprdrServerContext *clipboard;
+    InputSession *input;
+    bool clipboardOpened;
     bool gfxOpened, ready, touching, authenticated;
     uint32_t sent, acknowledged, epoch;
     uint64_t lastAck, activatedAt, outputBlockedAt;
@@ -85,6 +98,9 @@ public:
     std::atomic<uint64_t> borrowedFrames{0}, copiedFrames{0}, coalescedMoves{0};
     std::atomic<uint64_t> queuedWaitTotal{0}, queuedWaitMax{0};
     std::atomic<bool> frameEventFailed{false};
+    std::atomic<bool> clipboardReady{false};
+    std::atomic<uint64_t> textEvents{0}, pasteRequests{0}, pasteCompleted{0};
+    __strong NSString *inputFailure = @"";
     HANDLE frameAvailable = nullptr;
     std::thread worker, clientWorker, watchdog;
     bool needsKey = true;
@@ -113,7 +129,15 @@ public:
             @"queuedToSendAverageMs": @(sent ? double(queuedWaitTotal.load()) / sent : 0),
             @"queuedToSendMaxMs": @(queuedWaitMax.load()),
             @"ackFrames": @(ackFrames.load()), @"droppedFrames": @(dropped.load()),
-            @"queuedFrames": @(count), @"queuedBytes": @(bytes), @"error": failure};
+            @"queuedFrames": @(count), @"queuedBytes": @(bytes), @"error": failure,
+            @"clipboardReady": @(clipboardReady.load()), @"textInputEvents": @(textEvents.load()),
+            @"pasteRequests": @(pasteRequests.load()), @"pasteCompleted": @(pasteCompleted.load()),
+            @"inputError": inputFailure};
+    }
+    void inputError(NSString *message) {
+        std::lock_guard<std::mutex> guard(stateMutex);
+        if (![inputFailure isEqual:message]) NSLog(@"RemoteIPad input: %@", message);
+        inputFailure = [message copy];
     }
     void clearQueue() {
         std::lock_guard<std::mutex> guard(queueMutex);
@@ -198,6 +222,8 @@ public:
     static BOOL contextNew(freerdp_peer *peer, rdpContext *base) {
         auto *ctx = reinterpret_cast<PeerContext *>(base);
         ctx->server = static_cast<Transport *>(peer->ContextExtra);
+        ctx->input = new (std::nothrow) InputSession;
+        if (!ctx->input) return FALSE;
         ctx->channels = WTSOpenServerA(reinterpret_cast<LPSTR>(base));
         if (!ctx->channels || ctx->channels == INVALID_HANDLE_VALUE) return FALSE;
         ctx->gfx = rdpgfx_server_context_new(ctx->channels);
@@ -206,10 +232,27 @@ public:
         ctx->gfx->rdpcontext = base;
         ctx->gfx->CapsAdvertise = caps;
         ctx->gfx->FrameAcknowledge = acknowledge;
+        ctx->clipboard = cliprdr_server_context_new(ctx->channels);
+        if (!ctx->clipboard) return FALSE;
+        ctx->clipboard->custom = ctx;
+        ctx->clipboard->rdpcontext = base;
+        ctx->clipboard->autoInitializationSequence = FALSE;
+        ctx->clipboard->useLongFormatNames = TRUE;
+        ctx->clipboard->streamFileClipEnabled = FALSE;
+        ctx->clipboard->canLockClipData = FALSE;
+        ctx->clipboard->ClientCapabilities = clipboardCapabilities;
+        ctx->clipboard->ClientFormatList = clipboardFormats;
+        ctx->clipboard->ClientFormatDataResponse = clipboardData;
+        ctx->clipboard->ClientFormatDataRequest = clipboardRequest;
         return ctx->gfx->Initialize(ctx->gfx, TRUE);
     }
     static void contextFree(freerdp_peer *, rdpContext *base) {
         auto *ctx = reinterpret_cast<PeerContext *>(base);
+        if (ctx->clipboard) {
+            if (ctx->clipboardOpened) ctx->clipboard->Close(ctx->clipboard);
+            cliprdr_server_context_free(ctx->clipboard);
+        }
+        delete ctx->input;
         if (ctx->gfx) rdpgfx_server_context_free(ctx->gfx);
         if (ctx->channels && ctx->channels != INVALID_HANDLE_VALUE) WTSCloseServer(ctx->channels);
     }
@@ -343,6 +386,7 @@ public:
         if (flags & PTR_FLAGS_BUTTON1) {
             if (!flushMove(ctx)) return FALSE;
             bool down = (flags & PTR_FLAGS_DOWN) != 0;
+            if (down) cancelText(ctx);
             if (down == ctx->touching) return TRUE;
             return injectTouch(ctx, down ? @"down" : @"up", x, y);
         }
@@ -354,12 +398,213 @@ public:
     static BOOL keyboard(rdpInput *input, UINT16 flags, UINT8 code) {
         auto *ctx = reinterpret_cast<PeerContext *>(input->context);
         if (!flushMove(ctx)) return FALSE;
-        if (ctx->ready && ctx->server->ready && code == 0x47 &&
-            !(flags & KBD_FLAGS_RELEASE) && (flags & KBD_FLAGS_EXTENDED)) {
-            NSString *error = [ctx->server->engine home];
-            if (error) { ctx->server->error(error); return FALSE; }
+        if (!ctx->ready || !ctx->server->ready || !ctx->authenticated) return TRUE;
+        bool down = !(flags & KBD_FLAGS_RELEASE);
+        auto &state = *ctx->input;
+        uint16_t key = inputFlow::usage(code, flags & KBD_FLAGS_EXTENDED);
+        if (!key || (flags & KBD_FLAGS_EXTENDED1)) {
+            ctx->server->inputError(@"不支持该键盘扫描码");
+            return TRUE;
         }
+        bool repeated = state.keys.down[key];
+        state.keys.down[key] = down;
+        if (key == 0x19 && state.keys.pasteKey) {
+            if (!down) state.keys.pasteKey = false;
+            return TRUE;
+        }
+        if (down && key == 0x19 && state.keys.pasteModifiers()) {
+            state.keys.pasteKey = true;
+            if (!repeated) requestPaste(ctx);
+            return TRUE;
+        }
+        if (down && !inputFlow::modifier(key)) cancelText(ctx);
+        if (key == 0x4a && state.homeKey) {
+            if (!down) state.homeKey = false;
+            return TRUE;
+        }
+        if (down && key == 0x4a && (flags & KBD_FLAGS_EXTENDED) &&
+            !state.keys.control() && !state.keys.down[0xe1] && !state.keys.down[0xe5] &&
+            !state.keys.down[0xe2] && !state.keys.down[0xe6] &&
+            !state.keys.down[0xe3] && !state.keys.down[0xe7]) {
+            state.homeKey = true;
+            NSString *error = [ctx->server->engine home];
+            if (error) ctx->server->inputError(error);
+            return TRUE;
+        }
+        bool shortcut = state.keys.pasteModifiers() &&
+            (key == 0x04 || key == 0x06 || key == 0x1b || key == 0x1d);
+        NSString *failure = nil;
+        if (shortcut) {
+            if (!setModifiers(ctx, false, true)) return TRUE;
+            failure = [ctx->server->engine key:0xe3 down:YES];
+        }
+        if (!failure) failure = [ctx->server->engine key:key down:down];
+        if (shortcut) {
+            NSString *release = [ctx->server->engine key:0xe3 down:NO];
+            if (!failure) failure = release;
+            if (!setModifiers(ctx, true, true)) return TRUE;
+        }
+        if (failure) ctx->server->inputError(failure);
         return TRUE;
+    }
+    static bool setModifiers(PeerContext *ctx, bool down, bool controlOnly = false) {
+        for (uint16_t key = 0xe0; key <= 0xe7; ++key) {
+            if (controlOnly && key != 0xe0 && key != 0xe4) continue;
+            if (!ctx->input->keys.down[key]) continue;
+            NSString *failure = [ctx->server->engine key:key down:down];
+            if (failure) {
+                ctx->server->inputError(failure);
+                [ctx->server->engine releaseKeys];
+                return false;
+            }
+        }
+        return true;
+    }
+    static void cancelText(PeerContext *ctx) {
+        auto &state = *ctx->input;
+        if (state.clipboard.wanted || !state.text.empty())
+            ctx->server->inputError(@"粘贴因新的输入或会话状态变化而取消");
+        state.clipboard.wanted = false;
+        state.text.clear(); state.offset = 0;
+        state.unicode.surrogate = 0;
+    }
+    static BOOL synchronize(rdpInput *input, UINT32) {
+        auto *ctx = reinterpret_cast<PeerContext *>(input->context);
+        cancelText(ctx);
+        [ctx->server->engine releaseKeys];
+        ctx->input->keys = {};
+        ctx->input->homeKey = false;
+        return TRUE;
+    }
+    static BOOL focusIn(rdpInput *input, UINT16 flags) { return synchronize(input, flags); }
+    static BOOL unicodeKeyboard(rdpInput *input, UINT16 flags, UINT16 code) {
+        auto *ctx = reinterpret_cast<PeerContext *>(input->context);
+        if (!ctx->ready || !ctx->server->ready || !ctx->authenticated || (flags & KBD_FLAGS_RELEASE))
+            return TRUE;
+        if (!flushMove(ctx)) return FALSE;
+        auto &state = *ctx->input;
+        if (state.clipboard.wanted || !state.text.empty()) {
+            state.clipboard.wanted = false; state.text.clear(); state.offset = 0;
+            ctx->server->inputError(@"粘贴因新的 Unicode 输入而取消");
+        }
+        std::u16string text;
+        auto result = state.unicode.feed(code, millis(), text);
+        if (result == inputFlow::Unicode::Invalid) ctx->server->inputError(@"无效或过期的 Unicode 键盘序列");
+        else if (result == inputFlow::Unicode::Ready) submitText(ctx, text.data(), text.size());
+        return TRUE;
+    }
+    static bool submitText(PeerContext *ctx, const char16_t *characters, size_t count) {
+        if (!setModifiers(ctx, false)) return false;
+        NSString *text = [[NSString alloc] initWithCharacters:reinterpret_cast<const unichar *>(characters)
+                                                     length:count];
+        NSString *failure = [ctx->server->engine text:text];
+        bool restored = setModifiers(ctx, true);
+        if (failure) { ctx->server->inputError(failure); return false; }
+        if (!restored) return false;
+        ++ctx->server->textEvents;
+        return true;
+    }
+    static void requestPaste(PeerContext *ctx) {
+        auto &state = *ctx->input;
+        state.unicode.surrogate = 0;
+        if (!ctx->clipboardOpened || !state.clipboard.hasText) {
+            ctx->server->inputError(@"客户端剪贴板没有可用的 Unicode 文本，或未启用剪贴板重定向");
+            return;
+        }
+        if (!state.text.empty() || !state.clipboard.request(millis())) {
+            ctx->server->inputError(@"上一次粘贴尚未完成；请等待，剪贴板超时后可能需要重连");
+            return;
+        }
+        CLIPRDR_FORMAT_DATA_REQUEST request{};
+        request.common.msgType = CB_FORMAT_DATA_REQUEST;
+        request.requestedFormatId = CF_UNICODETEXT;
+        UINT result = ctx->clipboard->ServerFormatDataRequest(ctx->clipboard, &request);
+        if (result) {
+            state.clipboard.outstanding = state.clipboard.wanted = false;
+            ctx->server->inputError(@"请求客户端剪贴板文本失败");
+        } else {
+            ++ctx->server->pasteRequests;
+            ctx->server->inputError(@"");
+        }
+    }
+    static UINT clipboardCapabilities(CliprdrServerContext *, const CLIPRDR_CAPABILITIES *) {
+        return CHANNEL_RC_OK;
+    }
+    static UINT clipboardFormats(CliprdrServerContext *clipboard, const CLIPRDR_FORMAT_LIST *list) {
+        auto *ctx = static_cast<PeerContext *>(clipboard->custom);
+        bool text = false;
+        for (UINT32 i = 0; i < list->numFormats; ++i)
+            if (list->formats[i].formatId == CF_UNICODETEXT) text = true;
+        cancelText(ctx);
+        ctx->input->clipboard.formats(text);
+        CLIPRDR_FORMAT_LIST_RESPONSE response{};
+        response.common.msgType = CB_FORMAT_LIST_RESPONSE;
+        response.common.msgFlags = CB_RESPONSE_OK;
+        return clipboard->ServerFormatListResponse(clipboard, &response);
+    }
+    static UINT clipboardData(CliprdrServerContext *clipboard, const CLIPRDR_FORMAT_DATA_RESPONSE *response) {
+        auto *ctx = static_cast<PeerContext *>(clipboard->custom);
+        auto &state = *ctx->input;
+        state.clipboard.expire(millis());
+        if (!state.clipboard.response()) {
+            ctx->server->inputError(@"已丢弃过期或非预期的剪贴板响应");
+            return CHANNEL_RC_OK;
+        }
+        if (!ctx->ready || !ctx->server->ready || !ctx->authenticated) return CHANNEL_RC_OK;
+        if (!(response->common.msgFlags & CB_RESPONSE_OK) ||
+            !inputFlow::clipboardText(response->requestedFormatData, response->common.dataLen, state.text)) {
+            ctx->server->inputError(@"剪贴板文本无效、超出 1 MiB 或客户端拒绝提供");
+            return CHANNEL_RC_OK;
+        }
+        state.offset = 0;
+        if (state.text.empty()) ++ctx->server->pasteCompleted;
+        return CHANNEL_RC_OK;
+    }
+    static UINT clipboardRequest(CliprdrServerContext *clipboard, const CLIPRDR_FORMAT_DATA_REQUEST *) {
+        CLIPRDR_FORMAT_DATA_RESPONSE response{};
+        response.common.msgType = CB_FORMAT_DATA_RESPONSE;
+        response.common.msgFlags = CB_RESPONSE_FAIL;
+        return clipboard->ServerFormatDataResponse(clipboard, &response);
+    }
+    static bool openClipboard(PeerContext *ctx) {
+        if (ctx->clipboardOpened ||
+            !WTSVirtualChannelManagerIsChannelJoined(ctx->channels, CLIPRDR_SVC_CHANNEL_NAME))
+            return true;
+        if (ctx->clipboard->Open(ctx->clipboard) != CHANNEL_RC_OK) return false;
+        ctx->clipboardOpened = true;
+        CLIPRDR_GENERAL_CAPABILITY_SET general{};
+        general.capabilitySetType = CB_CAPSTYPE_GENERAL;
+        general.capabilitySetLength = CB_CAPSTYPE_GENERAL_LEN;
+        general.version = CB_CAPS_VERSION_2;
+        general.generalFlags = CB_USE_LONG_FORMAT_NAMES;
+        CLIPRDR_CAPABILITIES capabilities{};
+        capabilities.common.msgType = CB_CLIP_CAPS;
+        capabilities.cCapabilitiesSets = 1;
+        capabilities.capabilitySets = reinterpret_cast<CLIPRDR_CAPABILITY_SET *>(&general);
+        CLIPRDR_MONITOR_READY monitor{};
+        monitor.common.msgType = CB_MONITOR_READY;
+        if (ctx->clipboard->ServerCapabilities(ctx->clipboard, &capabilities) != CHANNEL_RC_OK ||
+            ctx->clipboard->MonitorReady(ctx->clipboard, &monitor) != CHANNEL_RC_OK) return false;
+        ctx->server->clipboardReady = true;
+        return true;
+    }
+    static void pumpText(PeerContext *ctx) {
+        auto &state = *ctx->input;
+        if (state.clipboard.expire(millis()))
+            ctx->server->inputError(@"客户端剪贴板请求超过 3 秒，已取消；不会自动重放");
+        if (state.unicode.surrogate && millis() - state.unicode.started > 1000) {
+            state.unicode.surrogate = 0;
+            ctx->server->inputError(@"Unicode 代理对等待超时");
+        }
+        if (state.text.empty()) return;
+        size_t count = std::min<size_t>(256, state.text.size() - state.offset);
+        if (inputFlow::high(state.text[state.offset + count - 1])) --count;
+        bool sent = submitText(ctx, state.text.data() + state.offset, count);
+        state.offset += count;
+        if (!sent || state.offset == state.text.size()) {
+            if (sent) { ++ctx->server->pasteCompleted; ctx->server->inputError(@""); }
+            state.text.clear(); state.offset = 0;
+        }
     }
     static BOOL refresh(rdpContext *base, BYTE, const RECTANGLE_16 *) {
         [reinterpret_cast<PeerContext *>(base)->server->engine requestKeyframe];
@@ -368,6 +613,10 @@ public:
     static BOOL suppress(rdpContext *base, BYTE allow, const RECTANGLE_16 *) {
         auto *ctx = reinterpret_cast<PeerContext *>(base);
         if (!flushMove(ctx)) return FALSE;
+        cancelText(ctx);
+        [ctx->server->engine releaseKeys];
+        ctx->input->keys = {};
+        ctx->input->homeKey = false;
         ctx->server->ready = ctx->ready && allow;
         ctx->touching = false; ctx->move.pending = false;
         [ctx->server->engine releaseTouches];
@@ -400,13 +649,13 @@ public:
         result = result && freerdp_settings_set_string(settings,FreeRDP_NtlmSamFile,path(@"nla.sam").fileSystemRepresentation);
         for (auto setting : {FreeRDP_RdpSecurity,FreeRDP_ExtSecurity,FreeRDP_RemoteFxCodec,
                              FreeRDP_NSCodec,FreeRDP_SupportMultitransport,FreeRDP_GfxAVC444,
-                             FreeRDP_GfxAVC444v2,FreeRDP_RedirectClipboard,
+                             FreeRDP_GfxAVC444v2,
                              FreeRDP_WaitForOutputBufferFlush}) {
             result = result && freerdp_settings_set_bool(settings,setting,FALSE);
         }
         for (auto setting : {FreeRDP_TlsSecurity,FreeRDP_NlaSecurity,FreeRDP_Authentication,
                              FreeRDP_SupportGraphicsPipeline,FreeRDP_GfxH264,FreeRDP_RefreshRect,
-                             FreeRDP_SuppressOutput}) {
+                             FreeRDP_SuppressOutput,FreeRDP_RedirectClipboard,FreeRDP_UnicodeInput}) {
             result = result && freerdp_settings_set_bool(settings,setting,TRUE);
         }
         result = result && freerdp_settings_set_uint32(settings,FreeRDP_ColorDepth,32) &&
@@ -418,6 +667,9 @@ public:
         peer->PostConnect = postConnect; peer->Activate = activate;
         peer->context->input->MouseEvent = mouse;
         peer->context->input->KeyboardEvent = keyboard;
+        peer->context->input->UnicodeKeyboardEvent = unicodeKeyboard;
+        peer->context->input->SynchronizeEvent = synchronize;
+        peer->context->input->FocusInEvent = focusIn;
         peer->context->update->RefreshRect = refresh;
         peer->context->update->SuppressOutput = suppress;
         if (!result) error(@"RDP 配置初始化失败");
@@ -435,6 +687,12 @@ public:
             clearQueue(); ++dropped; [engine requestKeyframe]; return true;
         }
         if (ctx->epoch != frame->epoch) {
+            if (ctx->epoch) {
+                cancelText(ctx);
+                [engine releaseKeys];
+                ctx->input->keys = {};
+                ctx->input->homeKey = false;
+            }
             ctx->touching = false; ctx->move.pending = false;
             [engine releaseTouches]; ctx->epoch = frame->epoch;
         }
@@ -488,11 +746,13 @@ public:
                     }
                     HANDLE events[32]{};
                     if (frameEventFailed) { error(@"RDP 帧就绪通知失败"); break; }
-                    DWORD count = peer->GetEventHandles(peer,events,29);
+                    DWORD count = peer->GetEventHandles(peer,events,27);
                     if (!count) { error(@"RDP 网络事件不可用"); break; }
                     events[count++] = WTSVirtualChannelManagerGetEventHandle(ctx->channels);
                     HANDLE gfxEvent = rdpgfx_server_get_event_handle(ctx->gfx);
                     if (gfxEvent) events[count++] = gfxEvent;
+                    HANDLE clipboardEvent = ctx->clipboardOpened ? ctx->clipboard->GetEventHandle(ctx->clipboard) : nullptr;
+                    if (clipboardEvent) events[count++] = clipboardEvent;
                     if (ctx->ready && ready && !outputBlocked &&
                         (acknowledgementsSuspended || ctx->sent - ctx->acknowledged < 3))
                         events[count++] = frameAvailable;
@@ -515,6 +775,14 @@ public:
                             @"RDP 客户端已断开" : @"RDP 客户端已断开或认证失败");
                         break;
                     }
+                    if (peer->activated && ctx->authenticated && !openClipboard(ctx)) {
+                        error(@"无法初始化文本剪贴板通道"); break;
+                    }
+                    if (clipboardEvent && WaitForSingleObject(clipboardEvent, 0) == WAIT_OBJECT_0 &&
+                        ctx->clipboard->CheckEventHandle(ctx->clipboard) != CHANNEL_RC_OK) {
+                        error(@"文本剪贴板协议处理失败"); break;
+                    }
+                    if (ctx->ready && ready && ctx->authenticated) pumpText(ctx);
                     if (peer->activated && WTSVirtualChannelManagerGetDrdynvcState(ctx->channels) == DRDYNVC_STATE_READY &&
                         !ctx->gfxOpened) {
                         if (!ctx->gfx->Open(ctx->gfx)) { error(@"无法打开 RDPGFX 通道"); break; }
@@ -544,6 +812,7 @@ public:
             }
         } else error(@"RDP 会话初始化失败");
         ready = false;
+        clipboardReady = false;
         setOutputBlocked(true);
         [engine setStreaming:NO]; clearQueue();
         {

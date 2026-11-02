@@ -1,5 +1,6 @@
 #import "Engine.h"
 #include "LatencyFlow.hpp"
+#include "InputFlow.hpp"
 #import <UIKit/UIKit.h>
 #import <IOSurface/IOSurfaceRef.h>
 #import <VideoToolbox/VideoToolbox.h>
@@ -11,6 +12,7 @@
 #include <mutex>
 #include <cmath>
 #include <vector>
+#include <set>
 
 using HID = CFTypeRef;
 using HIDClient = CFTypeRef;
@@ -26,6 +28,7 @@ struct Touch { double x, y; uint32_t index; };
     std::mutex _stateMutex;
     std::mutex _inputMutex;
     std::map<uint32_t, Touch> _touches;
+    std::set<uint16_t> _keys;
     std::atomic<bool> _streaming, _keyRequested;
     std::atomic<int> _inFlight;
     std::atomic<uint32_t> _epoch, _sequence;
@@ -51,6 +54,7 @@ struct Touch { double x, y; uint32_t index; };
     void (*_append)(HID, HID, uint32_t);
     void (*_dispatch)(HIDClient, HID);
     HID (*_keyboard)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, Boolean, uint32_t);
+    HID (*_unicode)(CFAllocatorRef, uint64_t, const uint8_t *, uint32_t, uint32_t, uint32_t);
     void (*_sender)(HID, uint64_t);
     uint64_t _senderID;
 }
@@ -93,6 +97,7 @@ static void output(void *context, void *, OSStatus status, VTEncodeInfoFlags,
     _append = (decltype(_append))dlsym(RTLD_DEFAULT, "IOHIDEventAppendEvent");
     _dispatch = (decltype(_dispatch))dlsym(RTLD_DEFAULT, "IOHIDEventSystemClientDispatchEvent");
     _keyboard = (decltype(_keyboard))dlsym(RTLD_DEFAULT, "IOHIDEventCreateKeyboardEvent");
+    _unicode = (decltype(_unicode))dlsym(RTLD_DEFAULT, "IOHIDEventCreateUnicodeEvent");
     _sender = (decltype(_sender))dlsym(RTLD_DEFAULT, "IOHIDEventSetSenderID");
     auto createClient = (HIDClient (*)(CFAllocatorRef))dlsym(RTLD_DEFAULT, "IOHIDEventSystemClientCreate");
     if (createClient) _hidClient = createClient(NULL);
@@ -117,6 +122,8 @@ static void output(void *context, void *, OSStatus status, VTEncodeInfoFlags,
     }
     _state[@"inputAvailable"] = @(_hidClient && _hand && _finger && _integer &&
                                   _append && _dispatch && _sender && _senderID);
+    _state[@"keyboardAvailable"] = @(_hidClient && _keyboard && _dispatch && _integer && _sender && _senderID);
+    _state[@"unicodeInputAvailable"] = @(_hidClient && _unicode && _dispatch && _integer && _sender && _senderID);
     _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, DISPATCH_TIMER_STRICT, _queue);
     dispatch_source_set_timer(_timer, dispatch_time(DISPATCH_TIME_NOW, 0),
                               NSEC_PER_SEC, NSEC_PER_MSEC);
@@ -143,6 +150,7 @@ static void output(void *context, void *, OSStatus status, VTEncodeInfoFlags,
         });
     } else {
         [self releaseTouches];
+        [self releaseKeys];
         dispatch_async(_queue, ^{
             if (self->_streaming) return;
             [self destroyEncoder];
@@ -397,6 +405,49 @@ static void output(void *context, void *, OSStatus status, VTEncodeInfoFlags,
         _integer(event, 4, 1);
         _dispatch(_hidClient, event); CFRelease(event);
     }
+    return nil;
+}
+- (NSString *)key:(uint16_t)usage down:(BOOL)down {
+    if (!usage || usage > 0xe7) return @"Invalid keyboard usage";
+    if (!_keyboard || !_dispatch || !_hidClient || !_integer || !_sender || !_senderID)
+        return @"Keyboard injection unavailable";
+    std::lock_guard<std::mutex> guard(_inputMutex);
+    if (!down && !_keys.count(usage)) return nil;
+    HID event = _keyboard(NULL, mach_absolute_time(), 7, usage, down, 0);
+    if (!event) return @"Keyboard event allocation failed";
+    _sender(event, _senderID);
+    _integer(event, 4, 1);
+    _dispatch(_hidClient, event);
+    CFRelease(event);
+    if (down) _keys.insert(usage); else _keys.erase(usage);
+    return nil;
+}
+- (void)releaseKeys {
+    std::vector<uint16_t> keys;
+    { std::lock_guard<std::mutex> guard(_inputMutex); keys.assign(_keys.begin(), _keys.end()); }
+    for (auto key : keys) {
+        NSString *failure = [self key:key down:NO];
+        if (failure) [self error:failure];
+    }
+}
+- (NSString *)text:(NSString *)text {
+    if (!_unicode || !_dispatch || !_hidClient || !_integer || !_sender || !_senderID)
+        return @"Unicode input unavailable";
+    if (!text || text.length > inputFlow::maxTextBytes / 2) return @"Invalid text length";
+    std::u16string units(text.length, 0);
+    [text getCharacters:reinterpret_cast<unichar *>(units.data()) range:NSMakeRange(0, text.length)];
+    if (!inputFlow::validText(units)) return @"Invalid Unicode input";
+    if (units.empty()) return nil;
+    NSData *payload = [text dataUsingEncoding:NSUTF16LittleEndianStringEncoding];
+    if (!payload) return @"UTF-16 encoding failed";
+    std::lock_guard<std::mutex> guard(_inputMutex);
+    HID event = _unicode(NULL, mach_absolute_time(), static_cast<const uint8_t *>(payload.bytes),
+                        uint32_t(payload.length), 1, 0);
+    if (!event) return @"Unicode event allocation failed";
+    _sender(event, _senderID);
+    _integer(event, 4, 1);
+    _dispatch(_hidClient, event);
+    CFRelease(event);
     return nil;
 }
 @end

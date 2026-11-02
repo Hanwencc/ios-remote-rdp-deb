@@ -15,4 +15,7 @@ typedef void (^RIEncodedHandler)(CMSampleBufferRef sample, BOOL key,
 - (NSString *)touch:(NSDictionary *)message;
 - (void)releaseTouches;
 - (NSString *)home;
+- (NSString *)key:(uint16_t)usage down:(BOOL)down;
+- (NSString *)text:(NSString *)text;
+- (void)releaseKeys;
 @end

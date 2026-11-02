@@ -123,7 +123,7 @@
     [items addObject:probe];
     PSSpecifier *statusGroup = [PSSpecifier preferenceSpecifierNamed:@"运行状态"
         target:nil set:NULL get:NULL detail:nil cell:PSGroupCell edit:nil];
-    [statusGroup setProperty:@"画面和鼠标共用一个 RDP 会话，左键支持点按和拖动；不提供文本键盘、滚轮、多指或音频。编码帧率不是客户端显示帧率；采集与提交耗时不含异步编码完成、网络传输或客户端呈现。触控接口可用仅表示注入能力。状态超过 5 秒未更新时，请检查越狱和后台管理进程。"
+    [statusGroup setProperty:@"画面、鼠标和键盘共用一个 RDP 会话。Ctrl+V 按需获取电脑纯文本并直接输入，不覆盖 iPad 剪贴板；不支持反向复制、文件或图片粘贴。接口可用只表示注入能力，不代表输入框已经接收。编码帧率不是客户端显示帧率。状态超过 5 秒未更新时，请检查越狱和后台管理进程。"
                      forKey:@"footerText"];
     [items addObject:statusGroup];
     NSArray *fields = @[
@@ -133,6 +133,8 @@
         @[@"clientConnected", @"RDP 客户端"], @[@"gfxReady", @"图形通道"],
         @[@"capture", @"采集管线"], @[@"hardware", @"H.264 硬件编码"],
         @[@"inputAvailable", @"触控接口可用"], @[@"resolution", @"视频分辨率"],
+        @[@"keyboardAvailable", @"键盘接口可用"], @[@"unicodeInputAvailable", @"文本接口可用"],
+        @[@"clipboardReady", @"文本剪贴板通道"], @[@"inputError", @"最近输入错误"],
         @[@"fps", @"编码帧率"], @[@"bitrate", @"目标视频码率"],
         @[@"captureMs", @"采集与提交耗时"], @[@"error", @"最近错误"]
     ];
@@ -221,6 +223,8 @@
         return names[value] ?: [value description];
     }
     NSDictionary *booleans = @{@"hardware": @[@"使用中", @"未启用"],
+        @"keyboardAvailable": @[@"可用", @"不可用"], @"unicodeInputAvailable": @[@"可用", @"不可用"],
+        @"clipboardReady": @[@"已就绪", @"未就绪"],
         @"inputAvailable": @[@"可用", @"不可用"], @"clientConnected": @[@"已连接", @"未连接"],
         @"listening": @[@"监听中", @"未监听"], @"gfxReady": @[@"已就绪", @"未就绪"]};
     NSArray *labels = booleans[metric];
@@ -237,7 +241,7 @@
             [metric isEqual:@"fps"] ? @"FPS" : @"ms"];
     if ([metric isEqual:@"bitrate"] && value)
         return [NSString stringWithFormat:@"%.1f Mbps", [value doubleValue] / 1000000];
-    if ([metric isEqual:@"error"] && [value isEqual:@""]) return @"无";
+    if (([metric isEqual:@"error"] || [metric isEqual:@"inputError"]) && [value isEqual:@""]) return @"无";
     return value ? [value description] : @"未报告";
 }
 - (void)viewWillAppear:(BOOL)animated {

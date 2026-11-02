@@ -2,12 +2,15 @@
 
 ## 当前状态
 
-当前版本 **0.4.0~rc7**，用于个人设备试运行，不是已完成长期稳定性验收的通用发布版。
+当前版本 **0.4.0~rc8**，用于个人设备试运行，不是已完成长期稳定性验收的通用发布版。
 
 - 目标实机：iPad 第七代 / A10，iPadOS 18.7.9，palera1n rootless，Sileo。
 - Windows 原生 `mstsc` 直接连接局域网地址，固定 TCP **3389**，TLS + NLA/CredSSP。
 - 单客户端；1080×1440 竖屏、VideoToolbox 硬件 H.264 / RDPGFX AVC420，目标 60 FPS。
 - 设置 → 通用 → XYHelper Remote RDP：服务开关、RDP 账号密码修改、连接与编码状态。
+- rc8 增加 HID 键盘、Unicode 文本输入，以及 Windows → iPad 的 Ctrl+V 纯文本输入。
+  目标实机已验证独立进程 Unicode 输入和 mstsc 端到端英文、中文、emoji、多行、长文本、
+  按住 V 不重复提交、选区替换与修饰键释放；没有逐应用 Hook 或新的网络端口。
 - 已按用户授权卸载设备旧 0.3.0 网页包，删除旧配置、网页资源和独立 pilot，安装新版 rootless 包。
 - 两种包均已通过本地 Docker 编译和包结构校验：
   `iphoneos-arm` 为 rootful 布局，`iphoneos-arm64` 为 rootless 布局；**两者内部均为 ARM64 Mach-O，不支持 32 位 ARM**。
@@ -95,8 +98,12 @@ FreeRDP 服务端已在目标 rootless iPad 上编译、加载并完成实际连
 - 左键按下、拖动、释放映射一个触点；坐标按画面有效区域归一化，排除黑边。
 - 断线、关闭、修改账号和编码尺寸变化时释放触点，防止残留按压。
 - Home 已接入独立 Home 键的扩展扫描码，但尚未专项实机验证；系统辅助触控“小白点”
-  已在远程画面显示，并用于桌面/设置往返验证。滚轮和文本键盘输入未实现。
-- 不启用音频、剪贴板、磁盘、打印机重定向或多指操作。
+  已在远程画面显示，并用于桌面/设置往返验证。无修饰键的扩展 Home 保留为 iPad Home。
+- 普通键、左右修饰键、方向键、退格、回车及 F1–F12 映射 HID；实际字符由 iPad
+  的硬件键盘布局和输入法解释。Ctrl+A/C/X/Z 映射 iOS Command 快捷键，其他 Ctrl 保留原义。
+- Ctrl+V 按需通过 CLIPRDR 获取 `CF_UNICODETEXT`，以 Unicode HID 直接输入，
+  不读写 iPad 剪贴板；Ctrl+C 只复制到 iPad，不回传电脑。仅支持单向纯文本，
+  不支持文件、图片、HTML 或双向自动同步。滚轮、多指、音频、磁盘和打印机仍未启用。
 - 不绕过设备锁屏或受保护画面。越狱失效时服务不可用，不承诺系统重启后自动恢复越狱。
 
 ## 2. 采集路径重新评估
@@ -243,8 +250,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\Build.ps1 -Probe
 先运行 [Get-Dependencies.ps1](scripts/Get-Dependencies.ps1)，再运行 `Build.ps1 -Dependencies` 构建固定版本的 iOS 库。
 无参数生成两个个人 deb：
 
-- [com.xyhelper.remoteipad_0.4.0~rc7_iphoneos-arm.deb](packages/com.xyhelper.remoteipad_0.4.0~rc7_iphoneos-arm.deb)：rootful，ARM64 CPU。
-- [com.xyhelper.remoteipad_0.4.0~rc7_iphoneos-arm64.deb](packages/com.xyhelper.remoteipad_0.4.0~rc7_iphoneos-arm64.deb)：rootless，ARM64 CPU；当前 iPad 使用此包。
+- [com.xyhelper.remoteipad_0.4.0~rc8_iphoneos-arm.deb](packages/com.xyhelper.remoteipad_0.4.0~rc8_iphoneos-arm.deb)：rootful，ARM64 CPU。
+- [com.xyhelper.remoteipad_0.4.0~rc8_iphoneos-arm64.deb](packages/com.xyhelper.remoteipad_0.4.0~rc8_iphoneos-arm64.deb)：rootless，ARM64 CPU；当前 iPad 使用此包。
 
 `-Foundation` 编译 rootless 基础、管理工具、设置 bundle 和 hook，不生成 deb。
 `-Probe` 编译原生诊断程序。
@@ -332,9 +339,52 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\Open-Remote.ps1
 不提交密码，不证明视频可用。握手后主动断开产生未完成认证日志是预期行为。
 [Open-Remote.ps1](scripts/Open-Remote.ps1) 生成不含密码的连接文件；修改账号后可传 `-Username`。
 在 mstsc 输入远程密码并核对新证书指纹，不要继续使用旧 pilot 指纹。
-连接文件禁用剪贴板、音频、打印机和磁盘重定向，脚本不接管密码输入。
+连接文件启用文本剪贴板通道，禁用音频、打印机和磁盘重定向，脚本不接管密码输入。
+升级 rc8 后必须用重新生成的连接文件重连；旧文件中的 `redirectclipboard:i:0`
+会使 Ctrl+V 不可用。`-GenerateOnly` 只生成连接文件并验证服务端身份，不启动 mstsc。
 SSH 工具使用单一 JSON 请求；含引号的命令请直接调用脚本或用 PowerShell `-Command { ... }`，
 不要用原生 `-File ... -Command` 传递嵌套引号。
+
+### 键盘与文本粘贴验收
+
+- Windows 中文输入法是否直接提交到远程，取决于 mstsc 实际发送的事件；服务端支持
+  RDP Unicode 事件，已通过 Windows Unicode 注入验证，但不代表所有输入法组合状态都已认证。
+  也可切换 iPad 中文输入法，通过硬件按键打拼音，或在电脑复制中文后 Ctrl+V。
+- Ctrl+V 是“插入纯文本”，不是调用目标 App 的原生粘贴处理；应用的自动排版、
+  撤销分组、输入法及安全输入框仍由 iOS/App 决定。测试输入框关闭自动大写、
+  智能插入删除、自动纠正和智能标点，不能把它的逐字精确结果推广到所有 App。
+- 剪贴板响应最多 **1 MiB（含 UTF-16LE 终止符）**，严格校验长度、终止符和代理对，
+  将 CRLF/CR 规范为 LF。每轮最多发送 256 个 UTF-16 码元，不拆代理对，不阻塞视频等待。
+  不做规范化合并或富文本转换。
+- 请求超过 **3 秒**取消，不自动重放。CLIPRDR 没有请求 ID，迟到响应必须先丢弃，
+  才允许后续请求；客户端不再响应时需重连。剪贴板更新、鼠标重新点按、
+  新文本/非修饰按键、输入焦点同步和会话暂停会取消未完成的文本操作。
+  这些是 RDP 可见的输入边界，不保证检测到设备本地发生的所有焦点切换。
+- 断线、停服和会话暂停释放按键；状态和设置页分别显示键盘/文本接口、
+  文本剪贴板通道和最近输入错误。派发计数只证明事件已发送，不证明目标应用接收。
+  日志和状态不保存输入正文，不新增后台剪贴板监控。
+- Unicode HID 路径参考 MIT 项目 [icli](https://github.com/owngoal-dev/icli)，
+  许可证随包安装；没有引入 icli 运行时、SpringBoard 注入或额外的 MCP 服务。
+
+可重复测试（在项目目录运行；测试会短暂占用前台，请勿同时操作设备）：
+
+```powershell
+.\scripts\Build.ps1
+.\scripts\Build.ps1 -Probe
+.\scripts\Test-InputDevice.ps1 -KeepFixture
+.\scripts\Open-Remote.ps1 -DeviceAddress 192.168.88.106
+# 在另一 PowerShell 中，传入已连接目标设备的 mstsc PID：
+.\scripts\Test-RdpInput.ps1 -ClientProcessId <PID>
+.\scripts\Test-InputDevice.ps1 -CleanupOnly
+```
+
+`Test-InputDevice.ps1` 安装独立临时测试 App，读取其实际文本，验证中文、emoji、
+组合字符和换行，并运行输入状态、视频流背压和设置格式化回归测试。
+不加 `-KeepFixture` 时自动卸载；保留后请执行 `-CleanupOnly` 清理。
+`Test-RdpInput.ps1` 只向指定且位于前台的 mstsc 窗口发送测试事件，逐项核对
+iPad 测试输入框；会临时使用 Windows 剪贴板并恢复可安全备份的原始格式，
+不支持备份的格式会在修改前报错。`-SkipClipboard` 只测键盘/Unicode。
+两脚本不保存用户密码；测试 App 和诊断文字不进入正式包。
 
 ## 7. 后续实施关口
 

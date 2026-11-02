@@ -91,7 +91,7 @@ public:
         BOOL enabled = [configuration[@"enabled"] boolValue];
         state[@"managerRunning"] = @YES;
         state[@"updatedAt"] = @([NSDate date].timeIntervalSince1970);
-        state[@"version"] = @"0.4.0~rc7";
+        state[@"version"] = @"0.4.0~rc8";
         state[@"protocol"] = @"rdp-nla-avc420";
         state[@"port"] = @3389;
         state[@"service"] = !enabled ? @"disabled" : [transport[@"listening"] boolValue] ? @"running" : @"failed";
